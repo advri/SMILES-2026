@@ -14,57 +14,90 @@ Contract
 * Return a **list** — one element for a single split, K elements for k-fold.
 """
 
-from __future__ import annotations
-
 import numpy as np
-import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 
 def split_data(
-    y: np.ndarray,
-    df: pd.DataFrame | None = None,
-    test_size: float = 0.15,
-    val_size: float = 0.15,
-    random_state: int = 42,
-) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """Split dataset indices into train, validation, and test subsets.
-
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
-
-    Args:
-        y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
-                      Used for stratification.
-        df:           Optional full DataFrame (same row order as ``y``).
-                      Required for group-aware splits.
-        test_size:    Fraction of samples reserved for the held-out test set.
-        val_size:     Fraction of samples reserved for validation.
-        random_state: Random seed for reproducible splits.
-
-    Returns:
-        A list of ``(idx_train, idx_val, idx_test)`` tuples of integer index
-        arrays.  ``idx_val`` may be ``None``.
-
-    Student task:
-        Replace or extend the skeleton below.  The only contract is that the
-        function returns the list described above.
+    y,
+    df=None,
+    n_splits=5,
+    val_size=0.10,
+    test_size=0.20,
+    random_state=42,
+):
     """
+    Returns a list of (train_idx, val_idx, test_idx) tuples.
 
+    Strategy:
+    - If the dataset is large enough, use stratified outer k-fold test splits.
+    - Inside each outer training partition, carve out a stratified validation split.
+    - If the dataset is too small for stable k-fold stratification, fall back to
+      a single stratified train/val/test split.
+    """
+    _ = df  # kept for compatibility with the provided infrastructure
+
+    y = np.asarray(y).astype(int)
     idx = np.arange(len(y))
 
-    idx_train_val, idx_test = train_test_split(
-        idx,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y,
-    )
-    relative_val = val_size / (1.0 - test_size)
-    idx_train, idx_val = train_test_split(
-        idx_train_val,
-        test_size=relative_val,
-        random_state=random_state,
-        stratify=y[idx_train_val],
-    )
-    return [(idx_train, idx_val, idx_test)]
+    unique, counts = np.unique(y, return_counts=True)
+    if len(unique) < 2:
+        raise ValueError("Need at least two classes for stratified splitting.")
 
+    min_class_count = counts.min()
+
+    # Prefer 5-fold CV when possible, otherwise reduce the number of folds.
+    effective_splits = min(n_splits, int(min_class_count))
+
+    # Fallback to one stratified split if k-fold is not feasible.
+    if effective_splits < 2:
+        train_val_idx, test_idx = train_test_split(
+            idx,
+            test_size=test_size,
+            stratify=y,
+            random_state=random_state,
+        )
+
+        if val_size > 0:
+            relative_val_size = val_size / (1.0 - test_size)
+            train_idx, val_idx = train_test_split(
+                train_val_idx,
+                test_size=relative_val_size,
+                stratify=y[train_val_idx],
+                random_state=random_state,
+            )
+        else:
+            train_idx = train_val_idx
+            val_idx = None
+
+        return [(train_idx, val_idx, test_idx)]
+
+    skf = StratifiedKFold(
+        n_splits=effective_splits,
+        shuffle=True,
+        random_state=random_state,
+    )
+
+    splits = []
+
+    for fold_id, (train_val_idx, test_idx) in enumerate(skf.split(idx, y)):
+        if val_size > 0:
+            outer_test_fraction = len(test_idx) / len(y)
+            relative_val_size = val_size / max(1e-8, (1.0 - outer_test_fraction))
+
+            # Keep validation size in a safe range.
+            relative_val_size = float(np.clip(relative_val_size, 0.05, 0.30))
+
+            train_idx, val_idx = train_test_split(
+                train_val_idx,
+                test_size=relative_val_size,
+                stratify=y[train_val_idx],
+                random_state=random_state + fold_id,
+            )
+        else:
+            train_idx = train_val_idx
+            val_idx = None
+
+        splits.append((train_idx, val_idx, test_idx))
+
+    return splits
