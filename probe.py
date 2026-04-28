@@ -8,171 +8,194 @@ via ``evaluate.run_evaluation``.  All four public methods (``fit``,
 and their signatures must not change.
 """
 
-from __future__ import annotations
-
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
+
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_curve, roc_auc_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 
 class HallucinationProbe(nn.Module):
-    """Binary classifier that detects hallucinations from hidden-state features.
+    """
+    Stable and interpretable probe:
+        StandardScaler -> PCA -> LogisticRegression
+    with optional threshold tuning on validation data.
 
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
+    Kept as nn.Module because the infrastructure expects that class shape,
+    but the actual classifier is sklearn-based for robustness on small data.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        pca_components=0.95,
+        C=1.0,
+        max_iter=2000,
+        validation_size=0.15,
+        random_state=42,
+        tune_threshold=True,
+        class_weight="balanced",
+    ):
         super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
-        self._threshold: float = 0.5  # tuned by fit_hyperparameters()
 
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the network definition below.
-    # ------------------------------------------------------------------
-    def _build_network(self, input_dim: int) -> None:
-        """Instantiate the network layers.
+        self.pca_components = pca_components
+        self.C = C
+        self.max_iter = max_iter
+        self.validation_size = validation_size
+        self.random_state = random_state
+        self.tune_threshold = tune_threshold
+        self.class_weight = class_weight
 
-        Called once at the start of ``fit()`` when ``input_dim`` is known.
+        self.scaler = None
+        self.pca = None
+        self.clf = None
 
-        Args:
-            input_dim: Feature vector dimensionality.
+        self.threshold_ = 0.5
+        self.is_fitted_ = False
+        self.constant_class_ = None
+
+    def fit(self, X_train, y_train, X_val=None, y_val=None):
+        X_train = np.asarray(X_train, dtype=np.float32)
+        y_train = np.asarray(y_train).astype(int)
+
+        unique_classes = np.unique(y_train)
+        if len(unique_classes) == 1:
+            self.constant_class_ = int(unique_classes[0])
+            self.is_fitted_ = True
+            return self
+
+        if X_val is None or y_val is None:
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train,
+                y_train,
+                test_size=self.validation_size,
+                stratify=y_train,
+                random_state=self.random_state,
+            )
+        else:
+            X_val = np.asarray(X_val, dtype=np.float32)
+            y_val = np.asarray(y_val).astype(int)
+
+        self.scaler = StandardScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_val_scaled = self.scaler.transform(X_val)
+
+        self.pca = self._build_pca(X_train_scaled)
+        if self.pca is not None:
+            X_train_proc = self.pca.fit_transform(X_train_scaled)
+            X_val_proc = self.pca.transform(X_val_scaled)
+        else:
+            X_train_proc = X_train_scaled
+            X_val_proc = X_val_scaled
+
+        self.clf = LogisticRegression(
+            C=self.C,
+            penalty="l2",
+            solver="liblinear",
+            max_iter=self.max_iter,
+            class_weight=self.class_weight,
+            random_state=self.random_state,
+        )
+        self.clf.fit(X_train_proc, y_train)
+
+        if self.tune_threshold and len(np.unique(y_val)) > 1:
+            val_probs = self.clf.predict_proba(X_val_proc)[:, 1]
+            self.threshold_ = self._find_best_threshold(y_val, val_probs)
+        else:
+            self.threshold_ = 0.5
+
+        self.is_fitted_ = True
+        return self
+
+    def predict_proba(self, X):
+        self._check_is_fitted()
+        X = np.asarray(X, dtype=np.float32)
+
+        if self.constant_class_ is not None:
+            return np.full(len(X), float(self.constant_class_), dtype=np.float32)
+
+        X_proc = self._transform(X)
+        return self.clf.predict_proba(X_proc)[:, 1].astype(np.float32)
+
+    def predict(self, X, threshold=None):
+        probs = self.predict_proba(X)
+        thr = self.threshold_ if threshold is None else float(threshold)
+        return (probs >= thr).astype(int)
+
+    def evaluate(self, X, y):
+        y = np.asarray(y).astype(int)
+        probs = self.predict_proba(X)
+        preds = self.predict(X)
+
+        result = {
+            "accuracy": float(accuracy_score(y, preds)),
+            "f1": float(f1_score(y, preds, zero_division=0)),
+            "threshold": float(self.threshold_),
+        }
+
+        if len(np.unique(y)) > 1:
+            result["auroc"] = float(roc_auc_score(y, probs))
+        else:
+            result["auroc"] = float("nan")
+
+        return result
+
+    def forward(self, X):
         """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
+        nn.Module-compatible forward. Returns probabilities as a torch tensor.
+        """
+        probs = self.predict_proba(X)
+        return torch.from_numpy(probs)
+
+    def _transform(self, X):
+        X_scaled = self.scaler.transform(X)
+        if self.pca is not None:
+            return self.pca.transform(X_scaled)
+        return X_scaled
+
+    def _build_pca(self, X_train_scaled):
+        if self.pca_components is None:
+            return None
+
+        n_samples, n_features = X_train_scaled.shape
+
+        if isinstance(self.pca_components, float):
+            if not (0.0 < self.pca_components < 1.0):
+                raise ValueError("Float pca_components must be in (0, 1)")
+            return PCA(
+                n_components=self.pca_components,
+                svd_solver="full",
+                random_state=self.random_state,
+            )
+
+        n_components = int(self.pca_components)
+        n_components = min(n_components, n_features, max(1, n_samples - 1))
+        if n_components < 1:
+            return None
+
+        return PCA(
+            n_components=n_components,
+            svd_solver="auto",
+            random_state=self.random_state,
         )
 
-    # ------------------------------------------------------------------
+    def _find_best_threshold(self, y_true, probs):
+        precision, recall, thresholds = precision_recall_curve(y_true, probs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
+        if len(thresholds) == 0:
+            return 0.5
 
-        Args:
-            x: Float tensor of shape ``(n_samples, feature_dim)``.
+        f1_scores = 2.0 * precision[:-1] * recall[:-1] / np.clip(
+            precision[:-1] + recall[:-1],
+            1e-12,
+            None,
+        )
+        best_idx = int(np.nanargmax(f1_scores))
+        return float(thresholds[best_idx])
 
-        Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
-        """
-        if self._net is None:
-            raise RuntimeError(
-                "Network has not been built yet. Call fit() before forward()."
-            )
-        return self._net(x).squeeze(-1)
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the probe on labelled feature vectors.
-
-        Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-            y: Integer label vector of shape ``(n_samples,)``; 0 = truthful,
-               1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
-        X_scaled = self._scaler.fit_transform(X)
-
-        self._build_network(X_scaled.shape[1])
-
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
-
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
-        self.eval()
-        return self
-
-    def fit_hyperparameters(
-        self, X_val: np.ndarray, y_val: np.ndarray
-    ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
-
-        The chosen threshold is stored in ``self._threshold`` and used by
-        subsequent ``predict`` calls.  Call this after ``fit`` and before
-        ``predict``.
-
-        Args:
-            X_val: Validation feature matrix of shape
-                   ``(n_val_samples, feature_dim)``.
-            y_val: Integer label vector of shape ``(n_val_samples,)``;
-                   0 = truthful, 1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
-        probs = self.predict_proba(X_val)[:, 1]
-
-        # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
-
-        best_threshold = 0.5
-        best_f1 = -1.0
-        for t in candidates:
-            y_pred_t = (probs >= t).astype(int)
-            score = f1_score(y_val, y_pred_t, zero_division=0)
-            if score > best_f1:
-                best_f1 = score
-                best_threshold = float(t)
-
-        self._threshold = best_threshold
-        return self
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict binary labels for feature vectors.
-
-        Uses the decision threshold in ``self._threshold`` (default ``0.5``;
-        updated by ``fit_hyperparameters``).
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Integer array of shape ``(n_samples,)`` with values in ``{0, 1}``.
-        """
-        return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
-
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return class probability estimates.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Array of shape ``(n_samples, 2)`` where column 1 contains the
-            estimated probability of the hallucinated class (label 1).
-            Used to compute AUROC.
-        """
-        X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
-        return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-
+    def _check_is_fitted(self):
+        if not self.is_fitted_:
+            raise RuntimeError("HallucinationProbe is not fitted yet.")
