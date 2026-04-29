@@ -1,6 +1,5 @@
 """
 probe.py — Hallucination probe classifier (student-implemented).
-
 Implements ``HallucinationProbe``, a binary MLP that classifies feature
 vectors as truthful (0) or hallucinated (1).  Called from ``solution.py``
 via ``evaluate.run_evaluation``.  All four public methods (``fit``,
@@ -11,7 +10,6 @@ and their signatures must not change.
 import numpy as np
 import torch
 import torch.nn as nn
-
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_recall_curve, roc_auc_score
@@ -24,7 +22,6 @@ class HallucinationProbe(nn.Module):
     Stable and interpretable probe:
         StandardScaler -> PCA -> LogisticRegression
     with optional threshold tuning on validation data.
-
     Kept as nn.Module because the infrastructure expects that class shape,
     but the actual classifier is sklearn-based for robustness on small data.
     """
@@ -40,7 +37,6 @@ class HallucinationProbe(nn.Module):
         class_weight="balanced",
     ):
         super().__init__()
-
         self.pca_components = pca_components
         self.C = C
         self.max_iter = max_iter
@@ -52,7 +48,6 @@ class HallucinationProbe(nn.Module):
         self.scaler = None
         self.pca = None
         self.clf = None
-
         self.threshold_ = 0.5
         self.is_fitted_ = False
         self.constant_class_ = None
@@ -61,9 +56,19 @@ class HallucinationProbe(nn.Module):
         X_train = np.asarray(X_train, dtype=np.float32)
         y_train = np.asarray(y_train).astype(int)
 
+        if X_train.ndim == 1:
+            X_train = X_train.reshape(1, -1)
+
+        self.constant_class_ = None
+        self.is_fitted_ = False
+        self.threshold_ = 0.5
+
         unique_classes = np.unique(y_train)
         if len(unique_classes) == 1:
             self.constant_class_ = int(unique_classes[0])
+            self.scaler = None
+            self.pca = None
+            self.clf = None
             self.is_fitted_ = True
             return self
 
@@ -78,6 +83,8 @@ class HallucinationProbe(nn.Module):
         else:
             X_val = np.asarray(X_val, dtype=np.float32)
             y_val = np.asarray(y_val).astype(int)
+            if X_val.ndim == 1:
+                X_val = X_val.reshape(1, -1)
 
         self.scaler = StandardScaler()
         X_train_scaled = self.scaler.fit_transform(X_train)
@@ -110,24 +117,73 @@ class HallucinationProbe(nn.Module):
         self.is_fitted_ = True
         return self
 
+    def fit_hyperparameters(self, X_train, y_train, X_val=None, y_val=None):
+        """
+        Public API kept for compatibility with the evaluator/infrastructure.
+        Current implementation uses the parameters already provided in __init__,
+        so this method simply delegates to fit().
+        """
+        return self.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+
     def predict_proba(self, X):
+        """
+        Returns probabilities in sklearn-compatible shape (N, 2):
+            [:, 0] -> P(class=0)
+            [:, 1] -> P(class=1)
+        """
         self._check_is_fitted()
+
         X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+
+        n = X.shape[0]
 
         if self.constant_class_ is not None:
-            return np.full(len(X), float(self.constant_class_), dtype=np.float32)
+            if self.constant_class_ == 1:
+                p1 = np.ones(n, dtype=np.float32)
+            else:
+                p1 = np.zeros(n, dtype=np.float32)
+            return np.column_stack([1.0 - p1, p1]).astype(np.float32)
 
         X_proc = self._transform(X)
-        return self.clf.predict_proba(X_proc)[:, 1].astype(np.float32)
+        proba = np.asarray(self.clf.predict_proba(X_proc), dtype=np.float32)
+
+        if proba.ndim == 1:
+            p1 = proba.astype(np.float32)
+            return np.column_stack([1.0 - p1, p1]).astype(np.float32)
+
+        if proba.shape[1] == 2:
+            if hasattr(self.clf, "classes_"):
+                classes = np.asarray(self.clf.classes_)
+                if len(classes) == 2 and not np.array_equal(classes, np.array([0, 1])):
+                    idx0 = int(np.where(classes == 0)[0][0])
+                    idx1 = int(np.where(classes == 1)[0][0])
+                    return np.column_stack([proba[:, idx0], proba[:, idx1]]).astype(np.float32)
+            return proba.astype(np.float32)
+
+        if proba.shape[1] == 1:
+            p = proba[:, 0].astype(np.float32)
+            if hasattr(self.clf, "classes_") and len(self.clf.classes_) == 1:
+                only_class = int(self.clf.classes_[0])
+                if only_class == 1:
+                    p1 = p
+                else:
+                    p1 = 1.0 - p
+            else:
+                p1 = p
+            return np.column_stack([1.0 - p1, p1]).astype(np.float32)
+
+        raise RuntimeError(f"Unexpected predict_proba output shape: {proba.shape}")
 
     def predict(self, X, threshold=None):
-        probs = self.predict_proba(X)
+        probs = self.predict_proba(X)[:, 1]
         thr = self.threshold_ if threshold is None else float(threshold)
         return (probs >= thr).astype(int)
 
     def evaluate(self, X, y):
         y = np.asarray(y).astype(int)
-        probs = self.predict_proba(X)
+        probs = self.predict_proba(X)[:, 1]
         preds = self.predict(X)
 
         result = {
@@ -145,12 +201,17 @@ class HallucinationProbe(nn.Module):
 
     def forward(self, X):
         """
-        nn.Module-compatible forward. Returns probabilities as a torch tensor.
+        nn.Module-compatible forward. Returns probabilities as a torch tensor
+        with shape (N, 2).
         """
         probs = self.predict_proba(X)
         return torch.from_numpy(probs)
 
     def _transform(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+
         X_scaled = self.scaler.transform(X)
         if self.pca is not None:
             return self.pca.transform(X_scaled)
@@ -184,7 +245,6 @@ class HallucinationProbe(nn.Module):
 
     def _find_best_threshold(self, y_true, probs):
         precision, recall, thresholds = precision_recall_curve(y_true, probs)
-
         if len(thresholds) == 0:
             return 0.5
 
