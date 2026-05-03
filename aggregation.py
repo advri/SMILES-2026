@@ -15,104 +15,118 @@ Both stages are combined by ``aggregation_and_feature_extraction``, the
 single entry point called from the notebook.
 """
 
+from __future__ import annotations
+
 import torch
 
+N_SELECTED_LAYERS = 8
 
-def extract_geometric_features(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+
+def _masked_mean(layer_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Mean-pool token representations using the attention mask.
+
+    Args:
+        layer_states: Tensor of shape (n_layers, seq_len, hidden_dim).
+        attention_mask: Tensor of shape (seq_len,) with 1 for real tokens.
+
+    Returns:
+        Tensor of shape (n_layers, hidden_dim).
     """
-    Optional compact geometric features.
-    hidden: (n_layers, seq_len, hidden_dim)
-    mask  : (seq_len,)
+    mask = attention_mask.to(dtype=layer_states.dtype, device=layer_states.device)
+    mask = mask.view(1, -1, 1)  # (1, seq_len, 1)
+
+    denom = mask.sum(dim=1).clamp(min=1.0)  # (1, 1)
+    pooled = (layer_states * mask).sum(dim=1) / denom  # (n_layers, hidden_dim)
+    return pooled
+
+
+def aggregate(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Convert per-token hidden states into a single flat feature vector.
+
+    Args:
+        hidden_states:
+            Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
+            Layer index 0 is the token embedding; index -1 is the final
+            transformer layer.
+
+        attention_mask:
+            1-D tensor of shape ``(seq_len,)`` with 1 for real tokens and
+            0 for padding.
+
+    Returns:
+        A 1-D tensor of shape ``(N_SELECTED_LAYERS * hidden_dim,)``.
     """
-    valid_idx = mask.bool().nonzero(as_tuple=False).squeeze(-1)
-    if valid_idx.numel() == 0:
-        return torch.zeros(8, dtype=torch.float32)
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            f"hidden_states must have shape (n_layers, seq_len, hidden_dim), "
+            f"got {tuple(hidden_states.shape)}"
+        )
+    if attention_mask.ndim != 1:
+        raise ValueError(
+            f"attention_mask must have shape (seq_len,), got {tuple(attention_mask.shape)}"
+        )
 
-    x = hidden[:, valid_idx, :]  # (L, T, D)
+    # Exclude embedding layer.
+    transformer_layers = hidden_states[1:]  # (n_transformer_layers, seq_len, hidden_dim)
 
-    last = x[:, -1, :]                 # (L, D)
-    mean = x.mean(dim=1)               # (L, D)
-    std = x.std(dim=1, unbiased=False) # (L, D)
+    if transformer_layers.size(0) < N_SELECTED_LAYERS:
+        raise ValueError(
+            f"Need at least {N_SELECTED_LAYERS} transformer layers after excluding "
+            f"the embedding layer, but got {transformer_layers.size(0)}."
+        )
 
-    feats = [
-        torch.norm(last, dim=1).mean(),
-        torch.norm(mean, dim=1).mean(),
-        torch.norm(std, dim=1).mean(),
-        (last - mean).norm(dim=1).mean(),
-        last.var(dim=1, unbiased=False).mean(),
-        mean.var(dim=1, unbiased=False).mean(),
-        std.mean(),
-        std.max(),
-    ]
-    return torch.stack(feats).float()
+    selected_layers = transformer_layers[-N_SELECTED_LAYERS:]  # (K, seq_len, hidden_dim)
+    pooled = _masked_mean(selected_layers, attention_mask)     # (K, hidden_dim)
+
+    # Flatten so the public interface remains unchanged.
+    return pooled.reshape(-1)
 
 
-def _safe_tail(x: torch.Tensor, k: int) -> torch.Tensor:
+def extract_geometric_features(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Extract optional geometric / statistical features.
+
+    For this experiment we deliberately disable extra geometric features to keep
+    the representation clean and make the comparison against previous probes
+    easier to interpret.
+
+    Returns:
+        Empty 1-D tensor.
     """
-    x: (L, T, D)
-    returns last min(k, T) tokens
-    """
-    t = x.size(1)
-    return x[:, -min(k, t):, :]
+    return torch.zeros(
+        0,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
 
 
 def aggregation_and_feature_extraction(
-    hidden: torch.Tensor,
-    mask: torch.Tensor,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
     use_geometric: bool = False,
 ) -> torch.Tensor:
+    """Aggregate hidden states and optionally append geometric features.
+
+    Args:
+        hidden_states:
+            Tensor of shape ``(n_layers, seq_len, hidden_dim)`` for one sample.
+        attention_mask:
+            1-D tensor of shape ``(seq_len,)`` with 1 for real tokens.
+        use_geometric:
+            Whether to append geometric features.
+
+    Returns:
+        A 1-D float tensor of shape ``(feature_dim,)``.
     """
-    hidden: (n_layers, seq_len, hidden_dim)
-    mask  : (seq_len,)
-    returns 1D feature vector
-
-    Design:
-    - keep only last 4 transformer layers
-    - focus on final valid tokens (proxy for assistant response)
-    - use compact statistics:
-        * last token
-        * mean over last 8/16/32 tokens
-        * global mean
-        * tail-vs-global contrast
-    """
-    valid_idx = mask.bool().nonzero(as_tuple=False).squeeze(-1)
-    if valid_idx.numel() == 0:
-        out = torch.zeros(4 * hidden.size(-1) * 5, dtype=torch.float32)
-        if use_geometric:
-            out = torch.cat([out, torch.zeros(8, dtype=torch.float32)], dim=0)
-        return out
-
-    x = hidden[:, valid_idx, :]  # (L, T, D)
-
-    # Drop embedding layer if present and keep only final transformer layers
-    if x.size(0) > 1:
-        x = x[1:]
-    x = x[-4:] if x.size(0) >= 4 else x
-
-    # Core pooled representations
-    last_token = x[:, -1, :]                     # (L, D)
-    full_mean = x.mean(dim=1)                    # (L, D)
-
-    tail8 = _safe_tail(x, 8).mean(dim=1)         # (L, D)
-    tail16 = _safe_tail(x, 16).mean(dim=1)       # (L, D)
-    tail32 = _safe_tail(x, 32).mean(dim=1)       # (L, D)
-
-    # Contrast features: answer tail vs full context
-    diff16 = tail16 - full_mean                  # (L, D)
-
-    features = torch.cat(
-        [
-            last_token.reshape(-1),
-            tail8.reshape(-1),
-            tail16.reshape(-1),
-            tail32.reshape(-1),
-            diff16.reshape(-1),
-        ],
-        dim=0,
-    ).float()
+    agg_features = aggregate(hidden_states, attention_mask)
 
     if use_geometric:
-        geom = extract_geometric_features(hidden, mask)
-        features = torch.cat([features, geom], dim=0)
+        geo_features = extract_geometric_features(hidden_states, attention_mask)
+        return torch.cat([agg_features, geo_features], dim=0)
 
-    return features
+    return agg_features
